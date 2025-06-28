@@ -270,55 +270,90 @@ async function getRecordsByC1(db, tableName, c1Value) {
 }
 
 /**
- * Fetches records from the specified table with optional filtering, limiting, and offsetting.
+ * Dynamically builds and executes a SQL SELECT query with flexible filtering options.
+ * Supports comparison operators (_gt, _lt, _ne, _like) and paginated results.
+ * Automatically excludes system-reserved records (`id < 101`).
+ *
+ * Supported query param formats:
+ *   - column=value        → column = value
+ *   - column_gt=value     → column > value
+ *   - column_lt=value     → column < value
+ *   - column_ne=value     → column != value
+ *   - column_like=value   → column LIKE '%value%'
+ *   - limit=N             → LIMIT N
+ *   - offset=N            → OFFSET N
+ *
+ * Example:
+ *   GET /api/my_table/records?i1_gt=100&c2_like=test&limit=10
+ *
+ * Translates to:
+ *   SELECT * FROM my_table
+ *   WHERE id >= 101 AND i1 > 100 AND c2 LIKE '%test%'
+ *   LIMIT 10
+ *
  * @param {D1Database} db - The D1 database instance.
- * @param {string} tableName - The name of the table to fetch from.
- * @param {object} [options={}] - An object containing optional query parameters.
- * @param {number} [options.minId] - Minimum ID value (id > minId).
- * @param {number} [options.maxId] - Maximum ID value (id < maxId).
- * @param {number} [options.limit] - Maximum number of records to return.
- * @param {number} [options.offset] - Number of records to skip.
- * @returns {Promise<Array<object>>} An array of matching records.
+ * @param {string} tableName - The name of the table to query.
+ * @param {Object} filters - Key-value pairs representing query parameters.
+ * @returns {Promise<Object[]>} - Array of matching records.
  */
-async function getRecordsWithOptions(db, tableName, options = {}) {
-  try {
-    let query = `SELECT * FROM ${tableName}`;
-    const params = [];
-    const conditions = [];
+async function getRecordsWithOptions(db, tableName, filters) {
+  const conditions = ['id >= 101'];
+  const params = [];
 
-    if (options.minId !== undefined && options.minId !== null) {
-      conditions.push(`id > ?`);
-      params.push(options.minId);
+  const allowedColumns = [
+    'c1', 'c2', 'c3',
+    'i1', 'i2', 'i3',
+    'd1', 'd2', 'd3',
+    't1', 't2', 't3',
+    'v1', 'v2', 'v3'
+  ];
+
+  const operatorsMap = {
+    'gt': '>',
+    'lt': '<',
+    'ne': '!=',
+    'like': 'LIKE'
+  };
+
+  let limit, offset;
+
+  for (const [rawKey, rawValue] of Object.entries(filters)) {
+    if (rawKey === 'limit') {
+      limit = parseInt(rawValue);
+      continue;
     }
-    if (options.maxId !== undefined && options.maxId !== null) {
-      conditions.push(`id < ?`);
-      params.push(options.maxId);
-    }
-    // Add other conditions here if needed (e.g., c1_value)
-
-    if (conditions.length > 0) {
-      query += ` WHERE ${conditions.join(' AND ')}`;
+    if (rawKey === 'offset') {
+      offset = parseInt(rawValue);
+      continue;
     }
 
-    query += ` ORDER BY id ASC`; // Ensure consistent ordering for pagination
+    const match = rawKey.match(/^(\w+?)(?:_(gt|lt|ne|like))?$/);
+    if (!match) continue;
 
-    if (options.limit !== undefined && options.limit !== null) {
-      query += ` LIMIT ?`;
-      params.push(options.limit);
+    const [, column, opKey] = match;
+
+    if (!allowedColumns.includes(column)) continue;
+
+    const operator = operatorsMap[opKey] || '=';
+
+    if (operator === 'LIKE') {
+      conditions.push(`${column} LIKE ?`);
+      params.push(`%${rawValue}%`);
+    } else {
+      conditions.push(`${column} ${operator} ?`);
+      params.push(rawValue);
     }
-
-    if (options.offset !== undefined && options.offset !== null) {
-      query += ` OFFSET ?`;
-      params.push(options.offset);
-    }
-
-    const { results } = await db.prepare(query).bind(...params).all();
-    return results;
-  } catch (error) {
-    console.error(`Error fetching records from table ${tableName} with options:`, error);
-    throw new Error(`Failed to fetch records with options: ${error.message}`);
   }
+
+  let sql = `SELECT * FROM ${tableName} WHERE ${conditions.join(' AND ')}`;
+  if (limit) sql += ` LIMIT ${limit}`;
+  if (offset) sql += ` OFFSET ${offset}`;
+
+  const stmt = db.prepare(sql).bind(...params);
+  const result = await stmt.all();
+  return result.results;
 }
+
 
 /**
  * Updates an existing record by its ID.
@@ -651,38 +686,35 @@ export default {
                 } else {
                     return jsonResponse(1, 'Failed to create record', { details: insertResult.error }, 500);
                 }
-
+                        
             case 'GET': // Read
-                if (!auth.canRead) {
-                    return jsonResponse(1, 'Forbidden: Read access required.', null, 403);
-                }
-                if (id) {
-                    const records = await getRecordById(env.DB, tableName, id); // Returns an array
-                    if (records.length > 0) {
-                        return jsonResponse(0, null, records);
-                    } else {
-                        return jsonResponse(1, 'Record not found.', [], 404); // Return empty array in data for consistency
-                    }
-                } else if (url.searchParams.has('c1')) {
-                    const c1Value = url.searchParams.get('c1');
-                    const records = await getRecordsByC1(env.DB, tableName, c1Value);
-                    return jsonResponse(0, null, records);
+              if (!auth.canRead) {
+                return jsonResponse(1, 'Forbidden: Read access required.', null, 403);
+              }
+            
+              if (id) {
+                // Handle /records/:id
+                const records = await getRecordById(env.DB, tableName, id);
+                if (records.length > 0) {
+                  return jsonResponse(0, null, records);
                 } else {
-                    // Handle requests with min_id, limit, offset, or no parameters
-                    const minId = url.searchParams.has('min_id') ? parseInt(url.searchParams.get('min_id')) : undefined;
-                    const maxIdParam = url.searchParams.has('max_id') ? parseInt(url.searchParams.get('max_id')) : undefined; // This maxId is for filtering records
-                    const limit = url.searchParams.has('limit') ? parseInt(url.searchParams.get('limit')) : undefined;
-                    const offset = url.searchParams.has('offset') ? parseInt(url.searchParams.get('offset')) : undefined;
-
-                    if (minId !== undefined || maxIdParam !== undefined || limit !== undefined || offset !== undefined) {
-                        const records = await getRecordsWithOptions(env.DB, tableName, { minId, maxId: maxIdParam, limit, offset });
-                        return jsonResponse(0, null, records);
-                    } else {
-                        // If no specific ID, c1, or new options, return all records
-                        const allRecords = await getAllRecords(env.DB, tableName);
-                        return jsonResponse(0, null, allRecords);
-                    }
+                  return jsonResponse(1, 'Record not found.', [], 404);
                 }
+              } else {
+                // Parse all search params into a filter object
+                const filters = {};
+                for (const [key, value] of url.searchParams.entries()) {
+                  filters[key] = value;
+                }
+            
+                try {
+                  const records = await getRecordsWithOptions(env.DB, tableName, filters);
+                  return jsonResponse(0, null, records);
+                } catch (error) {
+                  console.error(`Error in GET /api/${tableName}/records:`, error);
+                  return jsonResponse(1, 'Error retrieving records.', { details: error.message }, 500);
+                }
+              }
 
             case 'PUT': // Update
                 if (!auth.canWrite) {
